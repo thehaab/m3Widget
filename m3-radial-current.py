@@ -1,0 +1,1268 @@
+#!/usr/bin/env python3
+import json
+import math
+import subprocess
+import time
+import tkinter as tk
+from pathlib import Path
+
+from Xlib import X, XK, display
+from Xlib.ext import xtest, shape
+
+try:
+    from evdev import UInput, ecodes
+except Exception:
+    UInput = None
+    ecodes = None
+
+try:
+    import pyatspi
+except Exception:
+    pyatspi = None
+
+
+CONFIG_PATH = Path.home() / ".config" / "m3-radial" / "config.json"
+
+SLOTS = [
+    ("up", -90, "menu"),
+    ("scroll_up", -90, "scroll"),
+    ("up_right", -45, "menu"),
+    ("right", 0, "menu"),
+    ("down_right", 45, "menu"),
+    ("down", 90, "menu"),
+    ("scroll_down", 90, "scroll"),
+    ("down_left", 135, "menu"),
+    ("left", 180, "menu"),
+    ("up_left", -135, "menu"),
+]
+
+KEY_ALIASES = {
+    "ctrl": "Control_L",
+    "control": "Control_L",
+    "alt": "Alt_L",
+    "shift": "Shift_L",
+    "super": "Super_L",
+    "meta": "Super_L",
+    "enter": "Return",
+    "return": "Return",
+    "esc": "Escape",
+    "escape": "Escape",
+    "space": "space",
+    "tab": "Tab",
+    "left": "Left",
+    "right": "Right",
+    "up": "Up",
+    "down": "Down",
+    "backspace": "BackSpace",
+    "delete": "Delete",
+    "print": "Print",
+    "printscreen": "Print",
+}
+
+MOUSE_BUTTONS = {
+    "left": 1,
+    "middle": 2,
+    "right": 3,
+    "wheel_up": 4,
+    "wheel_down": 5,
+    "back": 8,
+    "forward": 9,
+}
+
+
+def load_config():
+    return json.loads(CONFIG_PATH.read_text())
+
+
+class XEmitter:
+    def __init__(self):
+        self.disp = display.Display()
+
+    def _keycode(self, name):
+        xname = KEY_ALIASES.get(name.lower(), name)
+        keysym = XK.string_to_keysym(xname)
+
+        if not keysym and len(name) == 1:
+            keysym = XK.string_to_keysym(name)
+
+        if not keysym:
+            raise ValueError(f"Unknown key: {name}")
+
+        return self.disp.keysym_to_keycode(keysym)
+
+    def keys(self, combo):
+        parts = [p.strip() for p in combo.split("+") if p.strip()]
+        codes = [self._keycode(p) for p in parts]
+
+        for code in codes:
+            xtest.fake_input(self.disp, X.KeyPress, code)
+
+        for code in reversed(codes):
+            xtest.fake_input(self.disp, X.KeyRelease, code)
+
+        self.disp.sync()
+
+    def mouse(self, button_name):
+        button = MOUSE_BUTTONS[button_name]
+        xtest.fake_input(self.disp, X.ButtonPress, button)
+        xtest.fake_input(self.disp, X.ButtonRelease, button)
+        self.disp.sync()
+
+
+class AtspiScrollRangeProbe:
+    """
+    AT-SPI measurement only.
+
+    Never writes scrollbar position. It only measures the largest
+    usable vertical scrollbar range so wheel velocity can scale
+    with document length.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    @property
+    def available(self):
+        return pyatspi is not None
+
+    def _children(self, obj):
+        try:
+            count = int(obj.childCount)
+        except Exception:
+            return
+
+        for i in range(count):
+            try:
+                yield obj.getChildAtIndex(i)
+            except Exception:
+                pass
+
+    def measure_range(self):
+        if not self.available:
+            return None
+
+        try:
+            desktop = pyatspi.Registry.getDesktop(0)
+        except Exception:
+            return None
+
+        stack = [desktop]
+        candidates = []
+
+        max_nodes = int(
+            self.cfg.get(
+                "atspi_discovery_max_nodes",
+                4000,
+            )
+        )
+
+        seen = 0
+
+        while stack and seen < max_nodes:
+            obj = stack.pop()
+            seen += 1
+
+            try:
+                role = obj.getRole()
+            except Exception:
+                role = None
+
+            if role == getattr(
+                pyatspi,
+                "ROLE_SCROLL_BAR",
+                -1,
+            ):
+                vertical = True
+
+                try:
+                    comp = obj.queryComponent()
+                    ext = comp.getExtents(
+                        pyatspi.DESKTOP_COORDS
+                    )
+
+                    if (
+                        float(ext.width) > 0
+                        and float(ext.height) > 0
+                    ):
+                        vertical = (
+                            float(ext.height)
+                            >= float(ext.width)
+                        )
+                except Exception:
+                    pass
+
+                if vertical:
+                    try:
+                        val = obj.queryValue()
+
+                        minimum = float(
+                            val.minimumValue
+                        )
+
+                        maximum = float(
+                            val.maximumValue
+                        )
+
+                        span = (
+                            maximum
+                            - minimum
+                        )
+
+                        if (
+                            math.isfinite(span)
+                            and span > 0
+                        ):
+                            candidates.append(
+                                span
+                            )
+
+                    except Exception:
+                        pass
+
+            stack.extend(
+                self._children(obj) or []
+            )
+
+        if not candidates:
+            return None
+
+        return max(candidates)
+
+
+
+class HighResWheel:
+    # Linux uinput high-resolution vertical wheel.
+    # 120 REL_WHEEL_HI_RES units = one traditional wheel detent.
+
+    def __init__(self):
+        self.ui = None
+        self.ok = False
+        self.hi_code = None
+
+        if UInput is None or ecodes is None:
+            print("Smooth scroll unavailable; X11 fallback: python-evdev missing", flush=True)
+            return
+
+        self.hi_code = getattr(ecodes, "REL_WHEEL_HI_RES", 11)
+
+        try:
+            self.ui = UInput(
+                {ecodes.EV_REL: [ecodes.REL_WHEEL, self.hi_code]},
+                name="m3Widget High Resolution Wheel",
+                bustype=0x03,
+                vendor=0x1209,
+                product=0x0001,
+                version=1,
+            )
+            self.ok = True
+            print("Smooth scroll backend: uinput REL_WHEEL_HI_RES", flush=True)
+        except Exception as e:
+            print(f"Smooth scroll unavailable; X11 fallback: {e}", flush=True)
+
+    def emit(self, direction, units):
+        if not self.ok or self.ui is None:
+            return False
+
+        units = int(units)
+        if units <= 0:
+            return True
+
+        value = units if direction == "up" else -units
+
+        try:
+            self.ui.write(ecodes.EV_REL, self.hi_code, value)
+            self.ui.syn()
+            return True
+        except Exception as e:
+            print(f"High-res wheel emit failed; disabling: {e}", flush=True)
+            try:
+                self.ui.close()
+            except Exception:
+                pass
+            self.ui = None
+            self.ok = False
+            return False
+
+
+
+class RadialApp:
+    def __init__(self):
+        self.cfg = load_config()
+        self.emitter = XEmitter()
+        self.hires_wheel = HighResWheel()
+        self._hires_last_emit = 0.0
+        self._hires_unit_accumulator = 0.0
+
+        self.trigger_down = False
+        self.gesture_active = False
+        self.press_pos = None
+        self.selected = None
+        self._trigger_release_job = None
+        self._scroll_last_time = 0.0
+        self._scroll_accumulator = 0.0
+        self.atspi_probe = AtspiScrollRangeProbe(self.cfg)
+        self._scroll_range_scale = 1.0
+        self._scroll_backend = None
+
+        self.menu_center = None
+        self.slot_centers = {}
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+
+        self.slot_windows = {}
+        self.slot_frames = {}
+        self.slot_labels = {}
+
+        self.center_window = None
+        self.center_canvas = None
+        self.center_pie = None
+
+        self._build_windows()
+
+        self.trigger_disp = display.Display()
+        self.trigger_root = self.trigger_disp.screen().root
+        self.trigger_code = 202
+
+        self.trigger_root.grab_key(
+            self.trigger_code,
+            X.AnyModifier,
+            True,
+            X.GrabModeAsync,
+            X.GrabModeAsync,
+        )
+        self.trigger_disp.sync()
+
+        print("M3 radial active: X11 keycode 202", flush=True)
+
+        self.root.after(5, self._poll_trigger)
+        self.root.after(10, self._tick)
+
+    def _make_toplevel(self):
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+
+        try:
+            win.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+
+        self._make_input_transparent(win)
+
+        return win
+
+    def _make_input_transparent(self, win):
+        """
+        Make the complete native X11 tree backing this Tk Toplevel
+        transparent to pointer/button hit-testing while remaining visible.
+
+        Tk may expose an inner X window through winfo_id(), with another
+        wrapper above it. Shape all related windows except the X root.
+        """
+        try:
+            win.update_idletasks()
+
+            disp = self.emitter.disp
+            root = disp.screen().root
+            root_id = int(root.id)
+
+            xid = int(win.winfo_id())
+
+            def xwindow(window_id):
+                return disp.create_resource_object(
+                    "window",
+                    int(window_id),
+                )
+
+            targets = set()
+
+            # Start with the window Tk reports.
+            targets.add(xid)
+
+            # Walk descendants because Frame/Label children may have
+            # their own native input windows.
+            pending = [xid]
+
+            while pending:
+                current_id = pending.pop()
+
+                try:
+                    tree = xwindow(current_id).query_tree()
+                except Exception:
+                    continue
+
+                for child in tree.children:
+                    cid = int(child.id)
+
+                    if cid not in targets:
+                        targets.add(cid)
+                        pending.append(cid)
+
+            # Walk upward from Tk's XID. Tk commonly has an outer
+            # wrapper window that winfo_id() doesn't identify.
+            current_id = xid
+
+            for _ in range(4):
+                try:
+                    tree = xwindow(current_id).query_tree()
+                    parent_id = int(tree.parent.id)
+                except Exception:
+                    break
+
+                if parent_id == root_id:
+                    break
+
+                targets.add(parent_id)
+                current_id = parent_id
+
+            for target_id in targets:
+                try:
+                    xwindow(target_id).shape_rectangles(
+                        shape.SO.Set,
+                        shape.SK.Input,
+                        X.Unsorted,
+                        0,
+                        0,
+                        [],
+                    )
+                except Exception as e:
+                    print(
+                        f"Input-shape warning XID={target_id}: {e}",
+                        flush=True,
+                    )
+
+            disp.sync()
+
+            print(
+                "HUD click-through XIDs:",
+                ",".join(str(x) for x in sorted(targets)),
+                flush=True,
+            )
+
+        except Exception as e:
+            print(
+                f"Input transparency failed: {e}",
+                flush=True,
+            )
+
+
+    def _build_windows(self):
+        actions = self.cfg.get("actions", {})
+
+        for direction, _deg, _ring in SLOTS:
+            action = actions.get(direction, {})
+            icon = action.get("icon", "")
+            label = action.get("label", direction)
+
+            mode = self.cfg.get("ui_mode", "icons")
+            if mode == "icons":
+                text = icon or label[:1]
+            elif mode == "labels":
+                text = label
+            else:
+                text = f"{icon}  {label}" if icon else label
+
+            win = self._make_toplevel()
+            self.root.after_idle(
+                lambda w=win: self._make_input_transparent(w)
+            )
+
+            frame = tk.Frame(
+                win,
+                bg="#1b1d21",
+                highlightbackground="#4a4e55",
+                highlightcolor="#4a4e55",
+                highlightthickness=1,
+                bd=0,
+            )
+            frame.pack()
+
+            lbl = tk.Label(
+                frame,
+                text=text,
+                bg="#1b1d21",
+                fg="#e7e9ec",
+                font=(
+                    "Sans",
+                    int(self.cfg.get("icon_font_size", 17))
+                    if self.cfg.get("ui_mode", "icons") == "icons"
+                    else 10,
+                    "bold",
+                ),
+                padx=(
+                    int(self.cfg.get("icon_pad_x_px", 8))
+                    if self.cfg.get("ui_mode", "icons") == "icons"
+                    else 14
+                ),
+                pady=(
+                    int(self.cfg.get("icon_pad_y_px", 6))
+                    if self.cfg.get("ui_mode", "icons") == "icons"
+                    else 8
+                ),
+                bd=0,
+            )
+            lbl.pack()
+
+            self.slot_windows[direction] = win
+            self.slot_frames[direction] = frame
+            self.slot_labels[direction] = lbl
+
+        self.center_window = self._make_toplevel()
+        self.root.after_idle(
+            lambda: self._make_input_transparent(
+                self.center_window
+            )
+        )
+
+        self.center_size = int(self.cfg.get("center_size_px", 46))
+        self.center_canvas = tk.Canvas(
+            self.center_window,
+            width=self.center_size,
+            height=self.center_size,
+            bg="#15171a",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.center_canvas.pack()
+
+        inset = 3
+        self.center_canvas.create_oval(
+            inset,
+            inset,
+            self.center_size - inset,
+            self.center_size - inset,
+            fill="#1c1e22",
+            outline="#747982",
+            width=2,
+        )
+
+        pie_inset = 6
+        self.center_pie = self.center_canvas.create_arc(
+            pie_inset,
+            pie_inset,
+            self.center_size - pie_inset,
+            self.center_size - pie_inset,
+            start=0,
+            extent=44,
+            style=tk.PIESLICE,
+            fill="#f1f2f4",
+            outline="",
+            state="hidden",
+        )
+
+    def _measure_layout(self):
+        radius = int(self.cfg.get("menu_radius_px", 132))
+
+        self.center_window.update_idletasks()
+        center_w = self.center_window.winfo_reqwidth()
+        center_h = self.center_window.winfo_reqheight()
+
+        min_x = -center_w / 2
+        max_x = center_w / 2
+        min_y = -center_h / 2
+        max_y = center_h / 2
+
+        geometry = {}
+
+        for direction, deg, ring in SLOTS:
+            win = self.slot_windows[direction]
+            win.update_idletasks()
+
+            width = win.winfo_reqwidth()
+            height = win.winfo_reqheight()
+
+            angle = math.radians(deg)
+            slot_radius = (
+                int(self.cfg.get("scroll_radius_px", 205))
+                if ring == "scroll"
+                else radius
+            )
+            ox = math.cos(angle) * slot_radius
+            oy = math.sin(angle) * slot_radius
+
+            geometry[direction] = (ox, oy, width, height)
+
+            min_x = min(min_x, ox - width / 2)
+            max_x = max(max_x, ox + width / 2)
+            min_y = min(min_y, oy - height / 2)
+            max_y = max(max_y, oy + height / 2)
+
+        return (
+            center_w,
+            center_h,
+            geometry,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        )
+
+    def _compute_menu_center(self):
+        if not self.press_pos:
+            return None
+
+        (
+            _center_w,
+            _center_h,
+            _geometry,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        ) = self._measure_layout()
+
+        x, y = self.press_pos
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        margin = int(self.cfg.get("screen_margin_px", 10))
+
+        if x + min_x < margin:
+            x += margin - (x + min_x)
+
+        if x + max_x > screen_w - margin:
+            x -= (x + max_x) - (screen_w - margin)
+
+        if y + min_y < margin:
+            y += margin - (y + min_y)
+
+        if y + max_y > screen_h - margin:
+            y -= (y + max_y) - (screen_h - margin)
+
+        return (x, y)
+
+    def _position_windows(self):
+        if not self.press_pos:
+            return
+
+        (
+            center_w,
+            center_h,
+            geometry,
+            _min_x,
+            _max_x,
+            _min_y,
+            _max_y,
+        ) = self._measure_layout()
+
+        self.menu_center = self._compute_menu_center()
+        if not self.menu_center:
+            return
+
+        cx, cy = self.menu_center
+
+        self.center_window.geometry(
+            f"+{int(cx - center_w / 2)}+{int(cy - center_h / 2)}"
+        )
+
+        self.slot_centers = {}
+
+        for direction, _deg, _ring in SLOTS:
+            ox, oy, width, height = geometry[direction]
+
+            slot_cx = cx + ox
+            slot_cy = cy + oy
+            self.slot_centers[direction] = (slot_cx, slot_cy)
+
+            x = int(slot_cx - width / 2)
+            y = int(slot_cy - height / 2)
+
+            self.slot_windows[direction].geometry(f"+{x}+{y}")
+
+    def _show(self):
+        self._position_windows()
+
+        self.center_window.deiconify()
+        self.center_window.lift()
+
+        for win in self.slot_windows.values():
+            win.deiconify()
+            win.lift()
+
+        self.root.after_idle(self._position_windows)
+
+    def _hide(self):
+        self.center_window.withdraw()
+
+        for win in self.slot_windows.values():
+            win.withdraw()
+
+        self._highlight(None)
+        self._update_center_pie(None, None)
+
+    def _highlight(self, direction):
+        for d in self.slot_windows:
+            frame = self.slot_frames[d]
+            label = self.slot_labels[d]
+
+            if d == direction:
+                frame.configure(
+                    bg="#464a52",
+                    highlightbackground="#f1f2f4",
+                    highlightcolor="#f1f2f4",
+                    highlightthickness=2,
+                )
+                label.configure(
+                    bg="#464a52",
+                    fg="#ffffff",
+                )
+            else:
+                frame.configure(
+                    bg="#1b1d21",
+                    highlightbackground="#4a4e55",
+                    highlightcolor="#4a4e55",
+                    highlightthickness=1,
+                )
+                label.configure(
+                    bg="#1b1d21",
+                    fg="#e7e9ec",
+                )
+
+    def _update_center_pie(self, dx, dy):
+        if dx is None or dy is None:
+            self.center_canvas.itemconfigure(
+                self.center_pie,
+                state="hidden",
+            )
+            return
+
+        angle = math.degrees(math.atan2(-dy, dx))
+
+        self.center_canvas.itemconfigure(
+            self.center_pie,
+            start=angle - 22,
+            extent=44,
+            state="normal",
+        )
+
+    def _pointer(self):
+        return (
+            self.root.winfo_pointerx(),
+            self.root.winfo_pointery(),
+        )
+
+    def _slot_from_pointer(self, px, py):
+        if not self.slot_centers:
+            return None
+
+        best = None
+        best_dist = float("inf")
+
+        for direction, (sx, sy) in self.slot_centers.items():
+            dist = math.hypot(px - sx, py - sy)
+            if dist < best_dist:
+                best = direction
+                best_dist = dist
+
+        return best
+
+    def _reset_scroll_motion(self):
+        self._scroll_last_time = 0.0
+        self._scroll_accumulator = 0.0
+        self._scroll_backend = None
+        if hasattr(self, "atspi_scroller"):
+            self.atspi_scroller.clear()
+
+    def _maybe_live_scroll(self, action, menu_dist):
+        """
+        AT-SPI measures page/scrollbar size.
+        X11 wheel events perform the actual scrolling.
+        """
+
+        if action.get("type") != "scroll":
+            self._scroll_last_time = 0.0
+            self._scroll_accumulator = 0.0
+            self._scroll_range_scale = 1.0
+            return
+
+        direction = action.get(
+            "value",
+            "down",
+        ).lower()
+
+        if direction not in (
+            "up",
+            "down",
+        ):
+            return
+
+        now = time.monotonic()
+
+        print(
+            f"SCROLLDBG action={action.get('value')} "
+            f"menu_dist={menu_dist:.1f} "
+            f"selected={getattr(self, 'selected', None)}",
+            flush=True,
+        )
+
+        # First frame of a scroll gesture:
+        # measure range ONCE.
+        if self._scroll_last_time == 0.0:
+            self._scroll_last_time = now
+            self._scroll_accumulator = 0.0
+
+            measured = None
+
+            try:
+                measured = (
+                    self.atspi_probe
+                    .measure_range()
+                )
+            except Exception as e:
+                print(
+                    f"AT-SPI range probe failed: {e}",
+                    flush=True,
+                )
+
+            reference = float(
+                self.cfg.get(
+                    "scroll_reference_range",
+                    1000.0,
+                )
+            )
+
+            exponent = float(
+                self.cfg.get(
+                    "scroll_range_exponent",
+                    0.5,
+                )
+            )
+
+            if (
+                measured
+                and measured > 0
+                and reference > 0
+            ):
+                # Square-root scaling by default.
+                # A 100x larger document therefore gets 10x
+                # the maximum wheel rate rather than 100x,
+                # which preserves useful granularity.
+                scale = (
+                    measured
+                    / reference
+                ) ** exponent
+
+                max_scale = float(
+                    self.cfg.get(
+                        "scroll_max_range_scale",
+                        20.0,
+                    )
+                )
+
+                self._scroll_range_scale = max(
+                    0.5,
+                    min(
+                        max_scale,
+                        scale,
+                    ),
+                )
+
+                print(
+                    f"Measured range={measured:.1f}, "
+                    f"scroll scale="
+                    f"{self._scroll_range_scale:.2f}",
+                    flush=True,
+                )
+
+            else:
+                self._scroll_range_scale = 1.0
+
+                print(
+                    "No usable scrollbar range; "
+                    "scroll scale=1.0",
+                    flush=True,
+                )
+
+            return
+
+        dt = min(
+            0.050,
+            max(
+                0.0,
+                now - self._scroll_last_time,
+            ),
+        )
+
+        self._scroll_last_time = now
+
+        menu_radius = float(
+            self.cfg.get(
+                "menu_radius_px",
+                132,
+            )
+        )
+
+        start_radius = float(
+            self.cfg.get(
+                "scroll_speed_start_px",
+                self.cfg.get("scroll_radius_px", menu_radius + 46),
+            )
+        )
+
+        speed_span = float(
+            self.cfg.get(
+                "scroll_speed_span_px",
+                170,
+            )
+        )
+
+        raw = (
+            menu_dist
+            - start_radius
+        ) / max(
+            1.0,
+            speed_span,
+        )
+
+        strength = max(
+            0.0,
+            min(
+                1.0,
+                raw,
+            ),
+        )
+
+        # Smooth analog response.
+        smooth = (
+            strength
+            * strength
+            * (
+                3.0
+                - 2.0 * strength
+            )
+        )
+
+        curve = float(
+            self.cfg.get(
+                "scroll_speed_curve",
+                1.35,
+            )
+        )
+
+        shaped = (
+            smooth
+            ** max(
+                0.1,
+                curve,
+            )
+        )
+
+        min_rate = float(
+            self.cfg.get(
+                "scroll_min_rate_hz",
+                1.0,
+            )
+        )
+
+        max_rate = float(
+            self.cfg.get(
+                "scroll_max_rate_hz",
+                32.0,
+            )
+        )
+
+        # Reading-speed floor is intentionally NOT multiplied by
+        # document-length scale. This keeps the scroll icon itself slow
+        # and predictable even on extremely long pages.
+        reading_rate = float(
+            self.cfg.get(
+                "scroll_reading_rate_hz",
+                min_rate,
+            )
+        )
+
+        scaled_max_rate = (
+            max_rate
+            * self._scroll_range_scale
+        )
+
+        rate = (
+            reading_rate
+            + (
+                scaled_max_rate
+                - reading_rate
+            ) * shaped
+        )
+
+        # A selected scroll action must always move.
+        # The center of the scroll icon is the reading-speed floor.
+        rate = max(reading_rate, rate)
+
+        # Safety cap against event storms.
+        rate = min(
+            float(
+                self.cfg.get(
+                    "scroll_hard_cap_hz",
+                    180.0,
+                )
+            ),
+            rate,
+        )
+
+        print(
+            f"SCROLLDBG calc "
+            f"start={start_radius:.1f} "
+            f"raw={raw:.3f} "
+            f"strength={strength:.3f} "
+            f"shaped={shaped:.3f} "
+            f"reading={reading_rate:.2f} "
+            f"scale={self._scroll_range_scale:.2f} "
+            f"rate={rate:.2f} "
+            f"dt={dt:.4f}",
+            flush=True,
+        )
+
+        # High-resolution backend. Keep all existing proportional
+        # speed math above; only replace how the resulting rate is emitted.
+        if getattr(self, "hires_wheel", None) and self.hires_wheel.ok:
+            hires_hz = float(self.cfg.get("scroll_hires_rate_hz", 60.0))
+            hires_hz = max(30.0, min(120.0, hires_hz))
+
+            # Existing 'rate' is traditional wheel detents per second.
+            # Convert to high-resolution units (120 units = 1 detent).
+            units_per_second = rate * 120.0
+            self._hires_unit_accumulator += units_per_second * dt
+
+            interval = 1.0 / hires_hz
+
+            if (
+                self._hires_last_emit == 0.0
+                or now - self._hires_last_emit >= interval
+            ):
+                units = int(self._hires_unit_accumulator)
+
+                if units > 0:
+                    max_units = int(
+                        self.cfg.get(
+                            "scroll_hires_max_units_per_frame",
+                            120,
+                        )
+                    )
+                    units = min(max_units, units)
+
+                    if self.hires_wheel.emit(direction, units):
+                        self._hires_unit_accumulator -= units
+                        self._hires_last_emit = now
+                        return
+
+                self._hires_last_emit = now
+                return
+
+        # Existing X11 discrete-wheel fallback.
+        self._scroll_accumulator += (
+            rate * dt
+        )
+
+        ticks = int(
+            self._scroll_accumulator
+        )
+
+        if ticks <= 0:
+            return
+
+        ticks = min(
+            ticks,
+            int(
+                self.cfg.get(
+                    "scroll_max_burst_ticks",
+                    6,
+                )
+            ),
+        )
+
+        self._scroll_accumulator -= ticks
+
+        button = (
+            "wheel_up"
+            if direction == "up"
+            else "wheel_down"
+        )
+
+        for _ in range(ticks):
+            self.emitter.mouse(button)
+
+
+    def _run_action(self, direction):
+        action = self.cfg.get("actions", {}).get(direction)
+        if not action:
+            return
+
+        typ = action.get("type")
+        value = action.get("value", "")
+
+        try:
+            if typ == "keys":
+                self.emitter.keys(value)
+
+            elif typ == "mouse":
+                self.emitter.mouse(value)
+
+            elif typ == "scroll":
+                # Scroll actions are live while held and do not fire on release.
+                return
+
+            elif typ == "command":
+                subprocess.Popen(
+                    value,
+                    shell=True,
+                    start_new_session=True,
+                )
+
+        except Exception as e:
+            print(
+                f"Action error ({direction}): {e}",
+                flush=True,
+            )
+
+    def _tap_middle(self):
+        self.emitter.mouse("middle")
+
+    def _tick(self):
+        if self.trigger_down and self.press_pos:
+            px, py = self._pointer()
+
+            # Activation remains anchored to the physical M3-down point.
+            press_dx = px - self.press_pos[0]
+            press_dy = py - self.press_pos[1]
+            press_dist = math.hypot(press_dx, press_dy)
+
+            threshold = int(
+                self.cfg.get("movement_threshold_px", 28)
+            )
+
+            if not self.gesture_active and press_dist >= threshold:
+                self.gesture_active = True
+                self._show()
+
+            if self.gesture_active and self.menu_center:
+                # Once open, selection matches the ACTUAL displayed radial.
+                menu_dx = px - self.menu_center[0]
+                menu_dy = py - self.menu_center[1]
+                menu_dist = math.hypot(menu_dx, menu_dy)
+
+                cancel_radius = int(
+                    self.cfg.get("cancel_radius_px", threshold)
+                )
+
+                if menu_dist < cancel_radius:
+                    if self.selected is not None:
+                        self.selected = None
+                        self._reset_scroll_motion()
+                        self._highlight(None)
+
+                    self._update_center_pie(None, None)
+
+                else:
+                    self._update_center_pie(menu_dx, menu_dy)
+
+                    direction = self._slot_from_pointer(px, py)
+
+                    if direction != self.selected:
+                        self.selected = direction
+                        self._reset_scroll_motion()
+                        self._highlight(direction)
+
+                    if self.selected:
+                        action = self.cfg.get("actions", {}).get(self.selected, {})
+                        self._maybe_live_scroll(action, menu_dist)
+
+        self.root.after(10, self._tick)
+
+    def _handle_trigger(self, pressed):
+        if pressed:
+            if self.trigger_down:
+                return
+
+            self.trigger_down = True
+            self.gesture_active = False
+            self.press_pos = self._pointer()
+            self.menu_center = None
+            self.slot_centers = {}
+            self.selected = None
+            self._reset_scroll_motion()
+
+        else:
+            if not self.trigger_down:
+                return
+
+            active = self.gesture_active
+            selected = self.selected
+
+            self.trigger_down = False
+            self.gesture_active = False
+
+            self._hide()
+
+            self.press_pos = None
+            self.menu_center = None
+            self.slot_centers = {}
+            self.selected = None
+            self._reset_scroll_motion()
+
+            if active:
+                if selected:
+                    action = self.cfg.get("actions", {}).get(selected, {})
+                    if action.get("type") != "scroll":
+                        self.root.after(
+                            1,
+                            lambda d=selected: self._run_action(d),
+                        )
+            else:
+                self.root.after(1, self._tap_middle)
+
+    def _poll_trigger(self):
+        try:
+            while self.trigger_disp.pending_events():
+                event = self.trigger_disp.next_event()
+
+                if (
+                    event.type == X.KeyPress
+                    and event.detail == self.trigger_code
+                ):
+                    if self._trigger_release_job is not None:
+                        try:
+                            self.root.after_cancel(
+                                self._trigger_release_job
+                            )
+                        except Exception:
+                            pass
+                        self._trigger_release_job = None
+
+                    if not self.trigger_down:
+                        self._handle_trigger(True)
+
+                elif (
+                    event.type == X.KeyRelease
+                    and event.detail == self.trigger_code
+                ):
+                    if self._trigger_release_job is not None:
+                        try:
+                            self.root.after_cancel(
+                                self._trigger_release_job
+                            )
+                        except Exception:
+                            pass
+
+                    self._trigger_release_job = self.root.after(
+                        35,
+                        self._commit_trigger_release,
+                    )
+
+        except Exception as e:
+            print(f"Trigger error: {e!r}", flush=True)
+
+        self.root.after(5, self._poll_trigger)
+
+    def _commit_trigger_release(self):
+        self._trigger_release_job = None
+
+        if self.trigger_down:
+            self._handle_trigger(False)
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    RadialApp().run()
