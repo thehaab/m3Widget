@@ -1,0 +1,57 @@
+{
+  "movement_threshold_px": 28,
+  "menu_radius_px": 132,
+  "cancel_radius_px": 28,
+  "center_size_px": 46,
+  "screen_margin_px": 10,
+  "actions": {
+    "up": {
+      "label": "Copy",
+      "icon": "⧉",
+      "type": "keys",
+      "value": "ctrl+c"
+    },
+    "up_right": {
+      "label": "Paste",
+      "icon": "▣",
+      "type": "keys",
+      "value": "ctrl+v"
+    },
+    "right": {
+      "label": "Forward",
+      "icon": "→",
+      "type": "keys",
+      "value": "alt+right"
+    },
+    "down_right": {
+      "label": "Enter",
+      "icon": "↵",
+      "type": "keys",
+      "value": "enter"
+    },
+    "down": {
+      "label": "Terminal",
+      "icon": "⌘",
+      "type": "keys",
+      "value": "ctrl+alt+t"
+    },
+    "down_left": {
+      "label": "Screenshot",
+      "icon": "⌖",
+      "type": "keys",
+      "value": "print"
+    },
+    "left": {
+      "label": "Back",
+      "icon": "←",
+      "type": "keys",
+      "value": "alt+left"
+    },
+    "up_left": {
+      "label": "Undo",
+      "icon": "↶",
+      "type": "keys",
+      "value": "ctrl+z"
+    }
+  }
+}
