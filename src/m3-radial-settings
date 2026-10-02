@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+import json
+import math
+import subprocess
+import tkinter as tk
+from tkinter import ttk, messagebox
+from pathlib import Path
+
+CFG = Path.home() / ".config" / "m3-radial" / "config.json"
+
+DIRECTIONS = [
+    ("up", -90),
+    ("up_right", -45),
+    ("right", 0),
+    ("down_right", 45),
+    ("down", 90),
+    ("down_left", 135),
+    ("left", 180),
+    ("up_left", -135),
+]
+
+PRESETS = {
+    "Copy":         {"icon": "⧉", "type": "keys", "value": "ctrl+c"},
+    "Paste":        {"icon": "▣", "type": "keys", "value": "ctrl+v"},
+    "Cut":          {"icon": "✂", "type": "keys", "value": "ctrl+x"},
+    "Undo":         {"icon": "↶", "type": "keys", "value": "ctrl+z"},
+    "Redo":         {"icon": "↷", "type": "keys", "value": "ctrl+shift+z"},
+    "Enter":        {"icon": "↵", "type": "keys", "value": "enter"},
+    "Back":         {"icon": "←", "type": "keys", "value": "alt+left"},
+    "Forward":      {"icon": "→", "type": "keys", "value": "alt+right"},
+    "Screenshot":   {"icon": "⌖", "type": "keys", "value": "print"},
+    "Terminal":     {"icon": "⌘", "type": "command", "value": "gnome-terminal"},
+    "Middle Click": {"icon": "●", "type": "mouse", "value": "middle"},
+    "Custom…":      {"icon": "•", "type": "keys", "value": ""},
+}
+
+
+class SettingsApp:
+    def __init__(self):
+        if not CFG.exists():
+            raise SystemExit(f"Missing config: {CFG}")
+
+        self.cfg = json.loads(CFG.read_text())
+        self.actions = self.cfg.setdefault("actions", {})
+        self.selected = "up"
+        self.drag_from = None
+
+        self.root = tk.Tk()
+        self.root.title("M3 Radial Settings")
+        self.root.geometry("900x640")
+        self.root.minsize(820, 590)
+
+        self._build_ui()
+        self.root.after(80, self._draw)
+        self._load_editor("up")
+
+    def _build_ui(self):
+        outer = ttk.Frame(self.root, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        left = ttk.Frame(outer)
+        left.pack(side="left", fill="both", expand=True)
+
+        right = ttk.Frame(outer, width=290)
+        right.pack(side="right", fill="y", padx=(18, 0))
+
+        ttk.Label(
+            left,
+            text="Click a slot to edit it • Drag one slot onto another to swap them",
+            font=("", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.canvas = tk.Canvas(
+            left,
+            bg="#111214",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+
+        ttk.Label(right, text="Selected slot", font=("", 12, "bold")).pack(anchor="w")
+        self.slot_label = ttk.Label(right, text="")
+        self.slot_label.pack(anchor="w", pady=(2, 12))
+
+        ttk.Label(right, text="Preset").pack(anchor="w")
+        self.preset = ttk.Combobox(
+            right,
+            state="readonly",
+            values=list(PRESETS.keys()),
+        )
+        self.preset.pack(fill="x", pady=(2, 10))
+        self.preset.bind("<<ComboboxSelected>>", self._apply_preset)
+
+        self.icon_var = tk.StringVar()
+        self.label_var = tk.StringVar()
+        self.type_var = tk.StringVar()
+        self.value_var = tk.StringVar()
+
+        ttk.Label(right, text="Icon").pack(anchor="w")
+        ttk.Entry(right, textvariable=self.icon_var).pack(fill="x", pady=(2, 8))
+
+        ttk.Label(right, text="Label").pack(anchor="w")
+        ttk.Entry(right, textvariable=self.label_var).pack(fill="x", pady=(2, 8))
+
+        ttk.Label(right, text="Action type").pack(anchor="w")
+        ttk.Combobox(
+            right,
+            textvariable=self.type_var,
+            state="readonly",
+            values=["keys", "mouse", "command"],
+        ).pack(fill="x", pady=(2, 8))
+
+        ttk.Label(right, text="Keys / mouse / command").pack(anchor="w")
+        ttk.Entry(right, textvariable=self.value_var).pack(fill="x", pady=(2, 6))
+
+        ttk.Label(
+            right,
+            text="Examples: ctrl+c · alt+right · enter · middle · gnome-terminal",
+            wraplength=270,
+            foreground="#666",
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Button(
+            right,
+            text="Apply to selected slot",
+            command=self._apply_editor,
+        ).pack(fill="x")
+
+        ttk.Separator(right).pack(fill="x", pady=16)
+
+        ttk.Label(right, text="Gesture threshold (px)").pack(anchor="w")
+        self.threshold_var = tk.IntVar(
+            value=int(self.cfg.get("movement_threshold_px", 28))
+        )
+        ttk.Scale(
+            right,
+            from_=10,
+            to=80,
+            variable=self.threshold_var,
+            orient="horizontal",
+        ).pack(fill="x")
+
+        ttk.Label(right, text="Menu radius (px)").pack(anchor="w", pady=(10, 0))
+        self.radius_var = tk.IntVar(
+            value=int(self.cfg.get("menu_radius_px", 132))
+        )
+        ttk.Scale(
+            right,
+            from_=95,
+            to=180,
+            variable=self.radius_var,
+            orient="horizontal",
+            command=lambda _=None: self._draw(),
+        ).pack(fill="x")
+
+        ttk.Button(
+            right,
+            text="Save + Restart Radial",
+            command=self._save,
+        ).pack(side="bottom", fill="x", pady=(8, 0))
+
+        ttk.Button(
+            right,
+            text="Reload from Disk",
+            command=self._reload,
+        ).pack(side="bottom", fill="x")
+
+    def _centers(self):
+        self.canvas.update_idletasks()
+        cx = self.canvas.winfo_width() / 2
+        cy = self.canvas.winfo_height() / 2
+        r = int(self.radius_var.get())
+
+        return {
+            d: (
+                cx + math.cos(math.radians(deg)) * r,
+                cy + math.sin(math.radians(deg)) * r,
+            )
+            for d, deg in DIRECTIONS
+        }
+
+    def _draw(self):
+        if not hasattr(self, "canvas"):
+            return
+
+        self.canvas.delete("all")
+        centers = self._centers()
+
+        cx = self.canvas.winfo_width() / 2
+        cy = self.canvas.winfo_height() / 2
+
+        self.canvas.create_oval(
+            cx - 24, cy - 24, cx + 24, cy + 24,
+            fill="#1c1e22", outline="#8a8f98", width=2
+        )
+        self.canvas.create_text(
+            cx, cy, text="M3", fill="white", font=("", 10, "bold")
+        )
+
+        for d, (x, y) in centers.items():
+            action = self.actions.get(
+                d,
+                {"label": d, "icon": "•", "type": "keys", "value": ""},
+            )
+            active = d == self.selected
+
+            self.canvas.create_rectangle(
+                x - 72, y - 24, x + 72, y + 24,
+                fill="#444850" if active else "#1b1d21",
+                outline="#f0f1f3" if active else "#4a4e55",
+                width=2 if active else 1,
+            )
+
+            icon = action.get("icon", "")
+            label = action.get("label", d)
+            text = f"{icon}  {label}" if icon else label
+
+            self.canvas.create_text(
+                x, y,
+                text=text,
+                fill="#ffffff" if active else "#e7e9ec",
+                font=("", 10, "bold"),
+            )
+
+    def _nearest_slot(self, x, y, maxdist=85):
+        best = None
+        bestdist = 10**9
+
+        for d, (sx, sy) in self._centers().items():
+            dist = math.hypot(x - sx, y - sy)
+            if dist < bestdist:
+                best = d
+                bestdist = dist
+
+        return best if bestdist <= maxdist else None
+
+    def _press(self, event):
+        d = self._nearest_slot(event.x, event.y)
+        if not d:
+            return
+
+        self.drag_from = d
+        self.selected = d
+        self._load_editor(d)
+        self._draw()
+
+    def _drag(self, event):
+        if not self.drag_from:
+            return
+
+        d = self._nearest_slot(event.x, event.y)
+        if d:
+            self.selected = d
+            self._draw()
+
+    def _release(self, event):
+        if not self.drag_from:
+            return
+
+        source = self.drag_from
+        target = self._nearest_slot(event.x, event.y)
+        self.drag_from = None
+
+        if target and target != source:
+            self.actions[source], self.actions[target] = (
+                self.actions[target],
+                self.actions[source],
+            )
+            self.selected = target
+        else:
+            self.selected = source
+
+        self._load_editor(self.selected)
+        self._draw()
+
+    def _load_editor(self, direction):
+        self.selected = direction
+
+        action = self.actions.get(
+            direction,
+            {"icon": "•", "label": direction, "type": "keys", "value": ""},
+        )
+
+        self.slot_label.config(
+            text=direction.replace("_", " ").title()
+        )
+        self.icon_var.set(action.get("icon", "•"))
+        self.label_var.set(action.get("label", direction))
+        self.type_var.set(action.get("type", "keys"))
+        self.value_var.set(action.get("value", ""))
+        self.preset.set("")
+
+    def _apply_preset(self, _event=None):
+        name = self.preset.get()
+        if not name:
+            return
+
+        preset = PRESETS[name]
+
+        self.icon_var.set(preset["icon"])
+        self.type_var.set(preset["type"])
+        self.value_var.set(preset["value"])
+
+        if name != "Custom…":
+            self.label_var.set(name)
+
+    def _apply_editor(self):
+        self.actions[self.selected] = {
+            "icon": self.icon_var.get() or "•",
+            "label": self.label_var.get() or self.selected,
+            "type": self.type_var.get() or "keys",
+            "value": self.value_var.get(),
+        }
+
+        self._draw()
+
+    def _save(self):
+        self._apply_editor()
+
+        self.cfg["actions"] = self.actions
+        self.cfg["movement_threshold_px"] = int(self.threshold_var.get())
+        self.cfg["menu_radius_px"] = int(self.radius_var.get())
+
+        CFG.write_text(json.dumps(self.cfg, indent=2) + "\n")
+
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "m3-radial"],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode:
+            messagebox.showerror(
+                "Restart failed",
+                result.stderr or result.stdout,
+            )
+        else:
+            messagebox.showinfo(
+                "Saved",
+                "Mappings saved and M3 Radial restarted.",
+            )
+
+    def _reload(self):
+        self.cfg = json.loads(CFG.read_text())
+        self.actions = self.cfg.setdefault("actions", {})
+
+        self.threshold_var.set(
+            int(self.cfg.get("movement_threshold_px", 28))
+        )
+        self.radius_var.set(
+            int(self.cfg.get("menu_radius_px", 132))
+        )
+
+        self._load_editor(self.selected)
+        self._draw()
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    SettingsApp().run()
