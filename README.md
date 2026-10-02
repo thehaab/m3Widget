@@ -240,3 +240,7 @@ Issues, bug reports, compatibility notes, and pull requests are welcome. See [`C
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+## Screenshot
+
+![m3Widget radial gesture menu](docs/m3widget-radial.png)
