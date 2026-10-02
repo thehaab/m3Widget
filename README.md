@@ -96,13 +96,13 @@ Press the middle mouse button and note the device ID printed for that event.
 Then install using that ID:
 
 ```bash
-./install.sh YOUR_DEVICE_ID
+bash install.sh YOUR_DEVICE_ID
 ```
 
 Example:
 
 ```bash
-./install.sh 1532:008a:2e08caa2
+bash install.sh 1532:008a:2e08caa2
 ```
 
 The installer places:
@@ -199,7 +199,13 @@ systemctl --user restart m3-radial
 ## Uninstall
 
 ```bash
-./uninstall.sh
+bash uninstall.sh
+```
+
+To also remove your saved m3Widget configuration:
+
+```bash
+bash uninstall.sh --purge
 ```
 
 ## Architecture
