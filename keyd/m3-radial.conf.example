@@ -1,0 +1,11 @@
+# Replace DEVICE_ID with the keyd device ID for the mouse interface
+# that emits middlemouse. Find it with:
+#   sudo keyd.rvaiya monitor
+# or, on some distributions:
+#   sudo keyd monitor
+
+[ids]
+DEVICE_ID
+
+[main]
+middlemouse = f24
